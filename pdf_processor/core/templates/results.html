@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>Processing Results</h2>
+    
+    {% if error %}
+        <div class="alert alert-danger">
+            {{ error }}
+        </div>
+    {% else %}
+        <div class="card">
+            <div class="card-header">
+                Job: {{ job.name }}
+            </div>
+            <div class="card-body">
+                <h5>Original Prompt:</h5>
+                <pre class="bg-light p-3">{{ job.prompt }}</pre>
+                
+                <h5 class="mt-4">Results:</h5>
+                <pre class="bg-light p-3">{{ result.result_data }}</pre>
+            </div>
+        </div>
+        
+        <a href="{% url 'core:home' %}" class="btn btn-primary mt-3">
+            Process Another PDF
+        </a>
+    {% endif %}
+</div>
+{% endblock %}

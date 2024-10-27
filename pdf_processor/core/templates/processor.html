@@ -1,0 +1,77 @@
+<!-- templates/processor.html -->
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+    <!-- Upload Section -->
+    <div class="upload-section">
+        <h2>Upload PDF</h2>
+        <form id="upload-form" method="post" enctype="multipart/form-data">
+            {% csrf_token %}
+            {{ form.as_p }}
+            <button type="submit" class="btn btn-primary">Process</button>
+        </form>
+    </div>
+
+    <!-- Results Section -->
+    <div id="results-section" class="mt-4" {% if not show_results %}style="display: none;"{% endif %}>
+        <h2>Processing Results</h2>
+        <div id="results-content">
+            {% if latest_result %}
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title">Results for: {{ latest_job.name }}</h5>
+                        <p class="card-text">{{ latest_result.result_data.text|linebreaks }}</p>
+                    </div>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<script>
+document.getElementById('upload-form').addEventListener('submit', function(e) {
+    e.preventDefault();
+    
+    const formData = new FormData(this);
+    
+    // Show loading indicator
+    document.getElementById('results-section').style.display = 'block';
+    document.getElementById('results-content').innerHTML = '<div class="text-center"><div class="spinner-border" role="status"><span class="sr-only">Processing...</span></div></div>';
+    
+    fetch('{% url "core:process" %}', {
+        method: 'POST',
+        body: formData,
+        headers: {
+            'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]').value
+        }
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            document.getElementById('results-content').innerHTML = `
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title">Processing Results</h5>
+                        <p class="card-text">${data.result}</p>
+                    </div>
+                </div>
+            `;
+        } else {
+            document.getElementById('results-content').innerHTML = `
+                <div class="alert alert-danger">
+                    Error: ${data.error}
+                </div>
+            `;
+        }
+    })
+    .catch(error => {
+        document.getElementById('results-content').innerHTML = `
+            <div class="alert alert-danger">
+                Error processing request: ${error}
+            </div>
+        `;
+    });
+});
+</script>
+{% endblock %}
