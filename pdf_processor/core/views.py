@@ -1,143 +1,184 @@
-# core/views.py
-from django.views.generic import FormView, TemplateView
+from django.views.generic import FormView
 from django.http import JsonResponse
 from django.conf import settings
 import google.generativeai as genai
-from google.generativeai import GenerativeModel
 import logging
+import json
+import pandas as pd
+from django.core.paginator import Paginator
 from .forms import ProcessingForm
 from .models import PDFDocument, ProcessingJob, ProcessingResult
 import base64
-import mimetypes
-import logging
 
 logger = logging.getLogger(__name__)
 
-def process_pdf(request):
-    try:
-        job = ProcessingJob.objects.latest('created_at')
-        pdf_document = PDFDocument.objects.get(job=job)
-        
-        job.status = 'processing'
-        job.save()
+MEDICAL_REVIEW_PROMPT = """You are a medical reviewer tasked with extracting specific information from case studies or case series related to meningioma patients. Your goal is to extract the following information and provide a confidence rating (1-5, with 5 being most confident) for each item. If information is not available, return an empty string for that item and a confidence rating of 1.
 
-        # Configure Gemini
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-1.5-pro')
-        
-        # Read and encode PDF content
-        with pdf_document.file.open('rb') as file:
-            pdf_content = file.read()
-            pdf_base64 = base64.b64encode(pdf_content).decode('utf-8')
-        
-        # Create proper content parts for Gemini
-        content_parts = [
-            {
-                "mime_type": "application/pdf",
-                "data": pdf_base64
-            },
-            job.prompt
-        ]
-        
-        # Generate response
-        response = model.generate_content(
-            content_parts,
-            generation_config={
-                "temperature": 0.7,
-                "top_p": 0.8,
-                "top_k": 40
-            }
-        )
-        
-        # Store result
-        ProcessingResult.objects.update_or_create(
-            document=pdf_document,
-            defaults={'result_data': {'text': response.text}}
-        )
-        
-        job.status = 'completed'
-        job.save()
-        pdf_document.processed = True
-        pdf_document.save()
-        
-        return JsonResponse({
-            'success': True,
-            'result': response.text
-        })
-    except Exception as e:
-        logger.error(f"Error processing PDF: {str(e)}", exc_info=True)
-        if 'job' in locals():
-            job.status = 'failed'
-            job.save()
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
+For each case, extract:
+0. Article Name
+1. Document Object Identifier (DOI)
+2. Study author (last name of first author)
+3. Year of publication
+4. Patient age
+5. Patient gender (M/F)
+6. Duration of symptoms (in months)
+7. Tumor location (Cranial or Spinal)
+8. Extent of resection (total or subtotal)
+9. WHO Grade
+10. Meningioma subtype
+11. Adjuvant therapy (y/n)
+12. Symptom assessment
+13. Recurrence (y/n)
+14. Patient status (A/D)
+15. Tumor invasion (y/n)
+
+Return the data in JSON format:
+{
+  "case_results": [
+    {
+      "0": {"value": "", "confidence": 1},
+      "1": {"value": "", "confidence": 1},
+      ...
+    }
+  ]
+}"""
 
 class ProcessorView(FormView):
     template_name = 'processor.html'
     form_class = ProcessingForm
     success_url = '/'
 
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        try:
+            latest_job = ProcessingJob.objects.latest('created_at')
+            latest_result = ProcessingResult.objects.get(document__job=latest_job)
+            
+            if latest_result.result_data and isinstance(latest_result.result_data, dict):
+                df = pd.DataFrame(latest_result.result_data.get('case_results', []))
+                paginator = Paginator(df.to_dict('records'), 10)
+                page = self.request.GET.get('page', 1)
+                table_data = paginator.get_page(page)
+                
+                context.update({
+                    'latest_job': latest_job,
+                    'table_data': table_data,
+                    'columns': df.columns.tolist() if not df.empty else [],
+                    'show_results': True
+                })
+        except (ProcessingJob.DoesNotExist, ProcessingResult.DoesNotExist):
+            context['show_results'] = False
+        return context
+
+    def extract_json_from_text(self, text):
+        text = text.replace('```json\n', '').replace('\n```', '')
+        start_idx = text.find('{')
+        end_idx = text.rfind('}') + 1
+        
+        if start_idx >= 0 and end_idx > start_idx:
+            return text[start_idx:end_idx]
+        raise ValueError("No valid JSON found in response")
+
+    def validate_and_normalize_json(self, json_str):
+        try:
+            data = json.loads(json_str)
+            if 'case_results' not in data:
+                data = {'case_results': [data]}
+                
+            for case in data['case_results']:
+                for i in range(16):
+                    key = str(i)
+                    if key not in case:
+                        case[key] = {"value": "", "confidence": 1}
+                    elif isinstance(case[key], (str, int, float)):
+                        case[key] = {"value": str(case[key]), "confidence": 1}
+            return data
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON format: {str(e)}")
+
+    def process_pdf_with_gemini(self, pdf_doc):
+        try:
+            genai.configure(api_key=settings.GEMINI_API_KEY)
+            model = genai.GenerativeModel('gemini-1.5-pro')
+            
+            with pdf_doc.file.open('rb') as file:
+                pdf_content = file.read()
+                pdf_base64 = base64.b64encode(pdf_content).decode('utf-8')
+            
+            response = model.generate_content(
+                [{"mime_type": "application/pdf", "data": pdf_base64}, MEDICAL_REVIEW_PROMPT],
+                generation_config={"temperature": 0.1, "top_p": 0.8, "top_k": 40}
+            )
+            
+            try:
+                json_str = self.extract_json_from_text(response.text)
+                parsed_json = self.validate_and_normalize_json(json_str)
+                return {
+                    'success': True,
+                    'parsed_json': parsed_json,
+                    'raw_text': response.text
+                }
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"JSON parsing error: {e}")
+                return {
+                    'success': False,
+                    'error': f"Failed to parse response as JSON: {str(e)}",
+                    'raw_text': response.text
+                }
+        except Exception as e:
+            logger.error(f"Error in process_pdf_with_gemini: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e),
+                'raw_text': getattr(response, 'text', 'No response text available')
+            }
+
     def form_valid(self, form):
         try:
-            logger.info("Starting form processing")
             job = form.save()
-            
-            # Save the PDF file
             pdf_doc = PDFDocument.objects.create(
                 job=job,
                 file=self.request.FILES['pdf_file']
             )
 
-            # Configure Gemini
-            genai.configure(api_key=settings.GEMINI_API_KEY)
-            model = genai.GenerativeModel('gemini-1.5-pro')
+            result = self.process_pdf_with_gemini(pdf_doc)
+            print(result)
+            if not result.get('success'):
+                raise ValueError(result.get('error', 'Unknown processing error'))
+
+            parsed_data = result['parsed_json']
             
-            # Read and encode PDF content
-            with pdf_doc.file.open('rb') as file:
-                pdf_content = file.read()
-                pdf_base64 = base64.b64encode(pdf_content).decode('utf-8')
-            
-            # Create proper content parts for Gemini
-            content_parts = [
-                {
-                    "mime_type": "application/pdf",
-                    "data": pdf_base64
-                },
-                job.prompt
-            ]
-            
-            # Generate response
-            response = model.generate_content(
-                content_parts,
-                generation_config={
-                    "temperature": 0.7,
-                    "top_p": 0.8,
-                    "top_k": 40
-                }
-            )
-            
-            # Save the results
-            result = ProcessingResult.objects.create(
-                document=pdf_doc,
-                result_data={'text': response.text}
-            )
-            
-            # Update statuses
-            job.status = 'completed'
-            job.save()
-            pdf_doc.processed = True
-            pdf_doc.save()
-            
-            return JsonResponse({
-                'success': True,
-                'result': response.text,
-                'job_id': job.id
-            })
-            
+            try:
+                df = pd.json_normalize(parsed_data['case_results'])
+                for col in [str(i) for i in range(16)]:
+                    if col not in df.columns:
+                        df[col] = pd.NA
+
+                ProcessingResult.objects.create(
+                    document=pdf_doc,
+                    result_data=parsed_data
+                )
+
+                job.status = 'completed'
+                job.save()
+
+                return JsonResponse({
+                    'success': True,
+                    'table_html': df.to_html(classes='table table-striped', index=False),
+                    'raw_text': result['raw_text'],
+                    'job_id': job.id
+                })
+
+            except Exception as e:
+                logger.error(f"DataFrame creation error: {str(e)}")
+                return JsonResponse({
+                    'success': False,
+                    'error': f"Error processing results: {str(e)}",
+                    'raw_text': result.get('raw_text', '')
+                })
+
         except Exception as e:
-            logger.error(f"Error processing form: {str(e)}", exc_info=True)
+            logger.error(f"Error in form_valid: {str(e)}", exc_info=True)
             if 'job' in locals():
                 job.status = 'failed'
                 job.save()
@@ -145,29 +186,6 @@ class ProcessorView(FormView):
                 'success': False,
                 'error': str(e)
             }, status=500)
-
-class ResultsView(TemplateView):
-    template_name = 'results.html'
-    
-    def get_context_data(self, **kwargs):
-        context = super().get_context_data(**kwargs)
-        job_id = self.kwargs.get('job_id')
-        
-        try:
-            job = ProcessingJob.objects.get(id=job_id)
-            result = ProcessingResult.objects.get(document__job=job)
-            context.update({
-                'job': job,
-                'result': result
-            })
-        except (ProcessingJob.DoesNotExist, ProcessingResult.DoesNotExist) as e:
-            logger.warning(f"Results not found for job ID: {job_id}")
-            context['error'] = 'Results not found'
-        except Exception as e:
-            logger.error(f"Error retrieving results: {str(e)}", exc_info=True)
-            context['error'] = 'An error occurred while retrieving results'
-        
-        return context
 
 def test_gemini(request):
     try:

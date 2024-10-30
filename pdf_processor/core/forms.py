@@ -28,3 +28,4 @@ class ProcessingForm(forms.ModelForm):
         if not file.name.endswith('.pdf'):
             raise forms.ValidationError('Only PDF files are allowed.')
         return file
+    

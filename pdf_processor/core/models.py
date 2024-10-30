@@ -1,9 +1,11 @@
 # core/models.py
 from django.db import models
 
+
+
 class ProcessingJob(models.Model):
     name = models.CharField(max_length=200)
-    prompt = models.TextField()
+    prompt = models.TextField(blank=True)  # Make prompt optional since we'll generate it
     created_at = models.DateTimeField(auto_now_add=True)
     status = models.CharField(
         max_length=20,
@@ -15,6 +17,7 @@ class ProcessingJob(models.Model):
         ],
         default='pending'
     )
+    columns = models.JSONField(null=True, blank=True)  # Add this field
 
     def __str__(self):
         return self.name
